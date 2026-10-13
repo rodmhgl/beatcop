@@ -1,17 +1,28 @@
 """Turn detected beats into a tempo map: a locked single tempo or a per-beat following map.
 
-Detection modes:
-  single - force one locked tempo (least-squares grid through the beats)
+Detection modes (see analyse_grid for the steadiness test):
+  single - force one locked tempo (the grid most beats land on)
   multi  - follow every detected beat (one tempo per beat interval)
   auto   - single when the beats sit on a steady grid, multi otherwise
+  doctor - like auto, but an unsteady track is re-tracked with a DBN (beatcop.dbn) first
 """
 
 from dataclasses import dataclass, field
 
 import numpy as np
 
-STEADY_RMS_S = 0.020  # beats within ~1 frame RMS of a straight grid count as "steady"
 MAX_METER = 12
+
+# Steadiness test constants.
+MIN_BEATS = 8
+TEMPO_TOL = 0.06  # an interval is "consistent" within 6% of the tempo...
+MAX_SKIP = 3  # ...even if it spans up to 3 beats (missed beats)
+ON_GRID_S = 0.025  # a beat within 25 ms of the fitted grid is on it
+WINDOW = 12  # local steadiness is judged over 12-beat windows...
+WINDOW_ON_GRID = 0.75  # ...needing 75% of their beats on grid
+STEADY_PCT = 85.0  # lock when 85% of windows are steady
+MIN_RUN = 16  # second chance: steady runs of at least 16 beats
+RELATED_RATIOS = (2 / 3, 3 / 4, 4 / 3, 3 / 2)  # tempo changes that still allow one grid
 
 
 @dataclass
@@ -83,6 +94,132 @@ def fit_grid(beats: np.ndarray) -> tuple[float, float, float]:
     return float(t0), float(period), rms
 
 
+def _phase(beats: np.ndarray, period: float) -> float:
+    """Grid offset in seconds from the circular mean of the beats' positions in the period."""
+    ang = 2 * np.pi * beats / period
+    return float(np.arctan2(np.sin(ang).sum(), np.cos(ang).sum()) / (2 * np.pi) * period)
+
+
+def _on_grid(beats: np.ndarray, period: float) -> np.ndarray:
+    phase = _phase(beats, period)
+    return np.abs(beats - (np.rint((beats - phase) / period) * period + phase)) < ON_GRID_S
+
+
+def refine_bpm(beats: np.ndarray, bpm: float) -> float:
+    """Two-stage grid search for the tempo the most beats land on: 0.9-1.1x in 0.05 BPM steps,
+    then +/-0.1 BPM in 0.004 BPM steps. Ties on the on-grid fraction go to the smallest mean
+    residual."""
+
+    def score(b: float) -> tuple[float, float]:
+        period = 60.0 / b
+        phase = _phase(beats, period)
+        res = np.abs(beats - (np.rint((beats - phase) / period) * period + phase))
+        return float(np.mean(res < ON_GRID_S)), -float(np.mean(np.minimum(res, ON_GRID_S)))
+
+    coarse = np.arange(bpm * 0.9, bpm * 1.1, 0.05)
+    best = max(coarse, key=lambda b: score(b)[0])
+    fine = np.arange(best - 0.1, best + 0.1, 0.004)
+    return float(max(fine, key=score))
+
+
+def round_bpm(bpm: float) -> float:
+    """Snap to a whole BPM when within 0.25 of it, else keep two decimals."""
+    whole = round(bpm)
+    return float(whole) if abs(bpm - whole) < 0.25 else round(bpm, 2)
+
+
+@dataclass
+class GridStats:
+    stable: bool = False
+    bpm: float = float("nan")  # refined tempo of the steady part
+    steady_pct: float = 0.0  # % of 12-beat windows with >= 75% of beats on grid
+    first: int = 0  # index of the first beat after any intro
+    second_chance: bool = False  # locked because steady runs bracket off-grid breaks
+
+
+def _steady_windows(on_grid: np.ndarray) -> np.ndarray:
+    n = len(on_grid)
+    counts = np.array([on_grid[max(0, i - WINDOW // 2): i + WINDOW // 2].sum() for i in range(n)])
+    return counts / WINDOW >= WINDOW_ON_GRID
+
+
+def _second_chance(beats: np.ndarray, steady: np.ndarray, bpm: float) -> bool:
+    """Lock anyway if long steady runs bracket breaks that are off-grid rather than in a new tempo.
+
+    A steady stretch inside a break is one whose intervals vary by under 3%."""
+    runs, i, n = [], 0, len(steady)
+    while i < n:
+        if steady[i]:
+            j = i
+            while j < n and steady[j]:
+                j += 1
+            if j - i >= MIN_RUN:
+                runs.append((i, j))
+            i = j
+        else:
+            i += 1
+    span = beats[-1] - beats[0]
+    if not runs or span <= 0:
+        return False
+    covered = sum(beats[j - 1] - beats[i] for i, j in runs)
+    if (covered / span < 0.4 or beats[runs[0][0]] - beats[0] > 0.25 * span
+            or beats[-1] - beats[runs[-1][1] - 1] > 0.25 * span):
+        return False
+    period = 60.0 / bpm
+    ibi = np.diff(beats)
+    gap = ~steady[:-1]
+    if gap.any() and np.mean(np.abs(ibi[gap] - period) / period <= TEMPO_TOL) > 0.35:
+        return False
+    for (_, a), (b, _) in zip(runs[:-1], runs[1:]):
+        seg = ibi[a:b]
+        for k in range(0, max(0, len(seg) - MIN_RUN) + 1):
+            win = seg[k : k + MIN_RUN]
+            if len(win) < MIN_RUN or np.std(win) / np.mean(win) >= 0.03:
+                continue
+            ratio = period / np.mean(win)
+            if 0.6 <= ratio <= 1.67 and not any(abs(ratio - r) / r <= 0.03 for r in RELATED_RATIOS):
+                return False
+    return True
+
+
+def analyse_grid(beats: np.ndarray) -> GridStats:
+    """Is the track steady enough to lock to one tempo? See the README for the rules."""
+    if len(beats) < MIN_BEATS:
+        return GridStats()
+    ibi = np.diff(beats)
+    bpms = 60.0 / np.maximum(ibi, 0.001)
+    med = np.median(bpms)
+    plausible = ibi[(bpms > 0.75 * med) & (bpms < 1.5 * med)]
+    period = float(np.median(plausible if len(plausible) else ibi))
+    tempo = 60.0 / period
+
+    k = np.maximum(1, np.rint(ibi / period))
+    consistent = (np.abs(60.0 / (ibi / k) - tempo) / tempo <= TEMPO_TOL) & (k <= MAX_SKIP)
+    first = int(np.argmax(consistent)) if consistent.any() else 0
+
+    tail = beats[first:]
+    stats = GridStats(bpm=tempo, first=first)
+    if len(tail) < WINDOW:
+        return stats
+    stats.bpm = refine_bpm(tail, tempo)
+    steady = _steady_windows(_on_grid(tail, 60.0 / stats.bpm))
+    stats.steady_pct = 100.0 * float(steady.mean())
+    stats.stable = stats.steady_pct >= STEADY_PCT
+    if not stats.stable and _second_chance(tail, steady, stats.bpm):
+        stats.stable = stats.second_chance = True
+    return stats
+
+
+def lock_grid(beats: np.ndarray, bpm: float) -> np.ndarray:
+    """A constant-tempo grid at `bpm`, phase-fitted to `beats`, spanning the beats."""
+    period = 60.0 / bpm
+    phase = _phase(beats, period)
+    k0 = int(np.rint((beats[0] - phase) / period))
+    k1 = int(np.rint((beats[-1] - phase) / period))
+    grid = phase + period * np.arange(k0, k1 + 1)
+    return grid[grid >= 0]
+
+
 def _snap(times: np.ndarray, grid: np.ndarray) -> np.ndarray:
     if not len(times) or not len(grid):
         return np.array([], dtype=np.float64)
@@ -141,21 +278,27 @@ def build(
     mode: str = "auto",
     scale: str | None = None,
     meter: int | None = None,
+    beat_logits: np.ndarray | None = None,
 ) -> TempoMap:
+    """Turn detected beats into a TempoMap. `beat_logits` (the model's frame-wise beat output)
+    is only needed for mode="doctor"."""
     if scale:
         beats = rescale(beats, downbeats, scale)
         downbeats = _snap(downbeats, beats)
 
-    if len(beats) >= 3 and mode in ("auto", "single"):
-        t0, period, rms = fit_grid(beats)
-        if mode == "single" or rms <= STEADY_RMS_S:
-            idx = beat_indices(beats)
-            beats = t0 + period * np.arange(idx[0], idx[-1] + 1)
-            beats = beats[beats >= 0]
-            downbeats = _snap(downbeats, beats)
-            mode = "single"
-    if mode != "single":
-        mode = "multi"
+    stats = analyse_grid(beats)
+    locked = mode == "single" or (mode in ("auto", "doctor") and stats.stable)
+    if mode == "doctor" and not locked and beat_logits is not None and len(beats) >= MIN_BEATS:
+        from beatcop.dbn import track
+
+        beats = track(beat_logits, stats.bpm, span=(beats[0], beats[-1]))
+        downbeats = _snap(downbeats, beats)
+    if locked and len(beats) >= 3:
+        bpm = stats.bpm if np.isfinite(stats.bpm) else 60.0 / fit_grid(beats)[1]
+        # beats before the first consistent interval are an intro: keep them as detected
+        beats = np.concatenate([beats[: stats.first], lock_grid(beats[stats.first:], round_bpm(bpm))])
+        downbeats = _snap(downbeats, beats)
+    mode = "single" if locked else "multi"
 
     if meter:
         first = int(np.searchsorted(beats, downbeats[0])) if len(downbeats) else 0

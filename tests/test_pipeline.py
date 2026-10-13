@@ -101,3 +101,54 @@ def test_model_finds_click_track():
         y[i : i + 2000] += np.sin(2 * np.pi * 1000 * np.arange(2000) / sr) * np.exp(-np.arange(2000) / 300)
     beats, _ = beatcop.detect(y, sr)
     assert 60 / np.median(np.diff(beats)) == pytest.approx(bpm, rel=0.05)
+
+
+def test_steadiness_locks_jittered_grid_and_rounds_bpm():
+    beats = _grid(120.1, 96, jitter=0.008)
+    stats = tempo.analyse_grid(beats)
+    assert stats.stable and stats.steady_pct >= tempo.STEADY_PCT
+    assert stats.bpm == pytest.approx(120.1, abs=0.1)
+    assert tempo.round_bpm(stats.bpm) == 120.0
+    assert tempo.round_bpm(127.6) == 127.6
+
+
+def test_free_intro_is_kept_and_the_rest_locked():
+    # free intro: no interval within 6% of the song's beat (0.513 s) or a multiple of it
+    intro = np.cumsum([0.5, 0.71, 0.37, 0.83, 0.66, 0.41, 0.77, 0.62, 0.35, 0.88])
+    song = intro[-1] + 0.7 + np.arange(80) * 60 / 117
+    beats = np.concatenate([intro, song])
+    stats = tempo.analyse_grid(beats)
+    assert stats.stable and stats.first >= 9
+    tm = tempo.build(beats, song[::4])
+    assert tm.mode == "single"
+    np.testing.assert_allclose(tm.beats[: stats.first], beats[: stats.first])
+
+
+def test_steadiness_rejects_drifting_tempo():
+    ibis = 60 / np.linspace(96, 124, 120)
+    beats = 0.5 + np.concatenate([[0], np.cumsum(ibis)])
+    assert not tempo.analyse_grid(beats).stable
+
+
+def test_second_chance_locks_through_an_off_grid_break():
+    a = _grid(120, 48)
+    # free-time break: no interval within 6% of the 0.5 s beat
+    brk = a[-1] + np.cumsum([0.7, 0.35, 0.8, 0.62, 0.4, 0.9, 0.33, 0.75, 0.65, 0.38, 0.85, 0.6])
+    c = a[0] + 0.5 * np.arange(int(np.ceil((brk[-1] + 0.3 - a[0]) / 0.5)), 200)[:48]  # back on grid
+    stats = tempo.analyse_grid(np.concatenate([a, brk, c]))
+    assert stats.stable and stats.second_chance
+
+
+def test_dbn_tracks_activation_with_tempo_drift():
+    from beatcop import dbn
+
+    ibis = 60 / np.linspace(100, 116, 40)
+    truth = 0.5 + np.concatenate([[0], np.cumsum(ibis)])
+    frames = np.arange(int((truth[-1] + 1) * 50))
+    logits = np.full(len(frames), -6.0)
+    for t in truth:
+        logits[int(round(t * 50))] = 3.0
+    logits[int(round(truth[10] * 50)) + 12] = 1.0  # a spurious off-beat peak
+    beats = dbn.track(logits, 108.0, span=(truth[0], truth[-1]))
+    assert len(beats) == len(truth)
+    assert np.abs(beats - truth).max() < 0.02

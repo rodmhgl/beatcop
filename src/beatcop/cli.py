@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from beatcop import detect_file, gp, midi, tempo, xsc
+from beatcop import audio, detect_frames, gp, midi, postprocess, tempo, xsc
 from beatcop.model import BeatModel
 
 
@@ -36,9 +36,10 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="beatcop", description=__doc__)
     p.add_argument("audio", type=Path)
     p.add_argument("-o", "--outdir", type=Path, help="default: beside the audio file")
-    p.add_argument("--mode", choices=["auto", "single", "multi"], default="auto",
+    p.add_argument("--mode", choices=["auto", "single", "multi", "doctor"], default="auto",
                    help="auto: locked tempo if steady, else follow beats; single: force one "
-                        "tempo; multi: per-beat tempo map")
+                        "tempo; multi: per-beat tempo map; doctor: like auto, but re-track "
+                        "unsteady music with a DBN (for complex or polyrhythmic material)")
     p.add_argument("--scale", choices=["half", "double"], help="rescale tempo an octave")
     p.add_argument("--meter", type=int, help="force N/4 and regroup bars every N beats")
     p.add_argument("--no-midi", action="store_true", help="skip the _tempo.mid tempo map")
@@ -49,11 +50,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--model", type=Path, help="ONNX model (default: models/ or $BEATCOP_MODEL)")
     args = p.parse_args(argv)
 
-    beats, downbeats = detect_file(args.audio, BeatModel(args.model))
+    beat_logits, downbeat_logits = detect_frames(*audio.load(args.audio), BeatModel(args.model))
+    beats, downbeats = postprocess.frames_to_beats(beat_logits, downbeat_logits)
     if len(beats) < 2:
         print("no beats detected", file=sys.stderr)
         return 1
-    tm = tempo.build(beats, downbeats, mode=args.mode, scale=args.scale, meter=args.meter)
+    tm = tempo.build(beats, downbeats, mode=args.mode, scale=args.scale, meter=args.meter,
+                     beat_logits=beat_logits)
 
     outdir = args.outdir or args.audio.parent
     outdir.mkdir(parents=True, exist_ok=True)
