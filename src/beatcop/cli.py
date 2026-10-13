@@ -1,4 +1,5 @@
-"""beatcop CLI: detect beats/downbeats in an audio file and write a .beats TSV and MIDI tempo map."""
+"""beatcop CLI: detect beats/downbeats in an audio file and write a .beats TSV plus MIDI, Guitar Pro
+and Transcribe! tempo maps."""
 
 import argparse
 import json
@@ -7,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from beatcop import detect_file, midi, tempo
+from beatcop import detect_file, gp, midi, tempo, xsc
 from beatcop.model import BeatModel
 
 
@@ -41,6 +42,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--scale", choices=["half", "double"], help="rescale tempo an octave")
     p.add_argument("--meter", type=int, help="force N/4 and regroup bars every N beats")
     p.add_argument("--no-midi", action="store_true", help="skip the _tempo.mid tempo map")
+    p.add_argument("--no-gp", action="store_true",
+                   help="skip the _tempo.gp Guitar Pro 8 file (embeds a copy of the audio)")
+    p.add_argument("--no-xsc", action="store_true", help="skip the .xsc Transcribe! markers")
     p.add_argument("--json", action="store_true", help="print results as JSON")
     p.add_argument("--model", type=Path, help="ONNX model (default: models/ or $BEATCOP_MODEL)")
     args = p.parse_args(argv)
@@ -57,6 +61,9 @@ def main(argv: list[str] | None = None) -> int:
     beats_path = outdir / f"{stem}.beats"
     _write_beats_tsv(tm, beats_path)
     midi_path = None if args.no_midi else midi.to_midi(tm, outdir / f"{stem}_tempo.mid")
+    gp_path = None if args.no_gp else gp.to_gp(tm, args.audio, outdir / f"{stem}_tempo.gp")
+    xsc_path = None if args.no_xsc else xsc.to_xsc(tm, args.audio, outdir / f"{stem}.xsc")
+    written = [p for p in (beats_path, midi_path, gp_path, xsc_path) if p]
 
     if args.json:
         print(json.dumps({
@@ -67,12 +74,14 @@ def main(argv: list[str] | None = None) -> int:
             "downbeats": np.round(tm.downbeats, 3).tolist(),
             "beats_file": str(beats_path),
             "midi_file": str(midi_path) if midi_path else None,
+            "gp_file": str(gp_path) if gp_path else None,
+            "xsc_file": str(xsc_path) if xsc_path else None,
         }))
     else:
         meters = ", ".join(f"{m}/4 from beat {i}" for i, m in tm.meters)
         print(f"{args.audio.name}: {len(tm.beats)} beats, {len(tm.downbeats)} downbeats, "
               f"{tm.bpm:.2f} BPM ({tm.mode}), metre {meters}")
-        print(f"wrote {beats_path}" + (f" and {midi_path}" if midi_path else ""))
+        print("wrote " + ", ".join(str(p) for p in written))
     return 0
 
 

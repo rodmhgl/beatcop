@@ -33,6 +33,41 @@ class TempoMap:
         return 60.0 / np.diff(self.beats)
 
 
+@dataclass(frozen=True)
+class Bar:
+    first_beat: int  # index into TempoMap.beats
+    beats: int  # beats (quarter notes) in the bar
+    start: float  # seconds
+    end: float  # seconds; the last bar is extrapolated past the final detected beat
+
+
+def bars(tm: TempoMap) -> list[Bar]:
+    """The bars of a tempo map in audio time: a pickup bar for any beats before the first bar
+    line (whole bars of them stay whole bars), then bars of the current metre."""
+    beats = tm.beats
+    n = len(beats)
+    last_ibi = float(beats[-1] - beats[-2])
+
+    def at(i: int) -> float:
+        return float(beats[i]) if i < n else float(beats[-1]) + (i - n + 1) * last_ibi
+
+    starts: list[tuple[int, int]] = []
+    first_bar, first_meter = tm.meters[0]
+    pickup = first_bar % first_meter
+    if pickup:
+        starts.append((0, pickup))
+    i = pickup
+    changes = dict(tm.meters)
+    meter = first_meter
+    while i < n:
+        meter = changes.get(i, meter)
+        # a metre change mid-bar (from --meter or odd downbeats) cuts the bar short there
+        nxt = next((c for c in changes if i < c < i + meter), i + meter)
+        starts.append((i, nxt - i))
+        i = nxt
+    return [Bar(i, k, at(i), at(i + k)) for i, k in starts]
+
+
 def beat_indices(beats: np.ndarray) -> np.ndarray:
     """Integer grid position of each beat, so a dropped beat leaves a gap instead of shifting the rest."""
     ibi = np.diff(beats)
