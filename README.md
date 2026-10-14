@@ -4,7 +4,7 @@ Beat, downbeat and tempo-map detection from audio. Runs the [Beat This!](https:/
 
 ## Setup
 
-The model isn't checked in. Export it once (this step needs torch):
+Needs Python 3.10+ and [uv](https://docs.astral.sh/uv/). The model isn't checked in. Export it once (this step needs torch):
 
 ```bash
 uv sync
@@ -27,26 +27,38 @@ uv run beatcop song.wav --scale half --meter 3 -o out/ --json
 | `--mode auto` | Locked tempo if the track is steady (see below), else per-beat (default) |
 | `--mode single` | One tempo: the grid the most beats land on |
 | `--mode multi` | One tempo per beat interval |
-| `--mode doctor` | Like auto, but unsteady tracks are re-tracked with a DBN first (complex or polyrhythmic music) |
-| `--scale half\|double` | Fix octave errors |
+| `--mode doctor` | Like auto, but unsteady tracks are re-tracked with a DBN and then followed per beat (complex or polyrhythmic music) |
+| `--scale half\|double` | Fix octave errors: `half` keeps every other beat (in phase with the first downbeat), `double` adds midpoints |
 | `--meter N` | Force N/4, regroup bars every N beats from the first downbeat |
 | `--no-midi` | Skip the MIDI file |
 | `--no-gp` | Skip the Guitar Pro file |
 | `--no-xsc` | Skip the Transcribe! file |
+| `-o, --outdir DIR` | Write outputs here (default: beside the audio) |
+| `--json` | Print mode, BPM, metres, beat and downbeat times and output paths as JSON |
+| `--model PATH` | ONNX model (default: `models/` or `$BEATCOP_MODEL`) |
 
 Outputs:
 
 - `song.beats` — TSV of `time<TAB>position-in-bar` (1 = downbeat); same format as Beat This!
 - `song_tempo.mid` — tempo map with one quarter note per beat. Import it at 0:00 / bar 1. A pickup bar puts the first detected downbeat on a bar line.
 - `song_tempo.gp` — Guitar Pro 8 file: an empty score with one bar per detected bar, the audio embedded as its audio track and synced bar by bar. Add tracks and write on top. Embeds a full copy of the audio.
-- `song.xsc` — Transcribe! document: a measure marker on every bar line (with its beat count) and a beat marker on every other beat. Keep it beside the audio.
+- `song.xsc` — Transcribe! document: a measure marker on every bar line (with its beat count) and a beat marker on every other beat. Keep it beside the audio. Under WSL, a `/mnt/<drive>/` audio path is written as the Windows path Transcribe! will see.
 
 Python API:
 
 ```python
 import beatcop
-beats, downbeats = beatcop.detect_file("song.wav")  # seconds
+from beatcop import tempo
+
+beats, downbeats = beatcop.detect_file("song.wav")      # seconds
+beatcop.detect(signal, sr)                               # same, from an array
+beat_logits, downbeat_logits = beatcop.detect_frames(signal, sr)  # raw 50 fps logits
+
+tm = tempo.build(beats, downbeats, mode="doctor", beat_logits=beat_logits)
+tm.mode, tm.bpm, tm.meters, tempo.bars(tm)
 ```
+
+Pass a `beatcop.BeatModel(path)` as `model=` to reuse one ONNX session across files.
 
 ## Pipeline
 
@@ -66,15 +78,16 @@ Implemented in `tempo.analyse_grid`:
 - Tempo refined by grid search (0.9–1.1×, 0.05 BPM steps, then ±0.1 in 0.004 steps), phase from the circular mean. A beat within 25 ms of the grid is on it.
 - **Steady** when ≥ 85% of 12-beat windows have ≥ 75% of beats on grid.
 - Second chance: steady runs of ≥ 16 beats covering ≥ 40% of the song, starting in the first 25% and ending in the last 25%, with off-tempo breaks (≤ 35% of break intervals at tempo) and no steady section at an unrelated tempo (2/3, 3/4, 4/3 and 3/2 are allowed).
-- Locked tempo snaps to a whole BPM when within 0.25.
+- Fewer than 8 beats, or fewer than 12 after the intro, is never steady.
+- Ties in the fine search go to the smallest mean residual. A steady section inside a break means 16 intervals varying < 3%; it must sit at 0.6–1.67× the tempo to count against locking.
+- Locked tempo snaps to a whole BPM when within 0.25, and the grid is phase-fitted to the beats after the intro.
 
-Doctor's DBN (`dbn.py`): 200 fps, observation λ 16, transition λ 100 (madmom's defaults), tempo range ±1.5× around the estimate.
+Doctor's DBN (`dbn.py`): 200 fps, observation λ 16, transition λ 100 (madmom's defaults), tempo range ±1.5× around the estimate. It runs on the model's beat logits, keeps beats within 0.1 s of the originally detected span, and downbeats are snapped onto the new beats.
 
 ## Caveats
 
 - If the first beat is less than 62.5 ms from 0:00, the MIDI pins it to 0:00 (DAWs cap tempo around 960 BPM). Every later beat stays exact.
 - Mistakes the model makes, such as briefly locking onto eighth notes, appear as odd bars in the metre. Override them with `--meter`, or try `--mode doctor`.
-- The fine tempo search breaks ties on the smallest mean residual, and a steady section inside a break means intervals varying < 3%.
 - Pieces under 30 s run through the model unpadded, as upstream does.
 
 ## Tests
