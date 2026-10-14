@@ -12,6 +12,7 @@ import json
 import re
 import uuid
 import zipfile
+from dataclasses import replace
 from importlib import resources
 from pathlib import Path
 
@@ -25,13 +26,23 @@ def _automation(kind: str, bar: int, value: str) -> str:
             f"<Position>0</Position>\n<Visible>true</Visible>\n<Value>{value}</Value>\n</Automation>")
 
 
-def _score(gpif: str, tm: TempoMap, asset_id: str, asset_path: str, audio_name: str) -> str:
+def _score(gpif: str, tm: TempoMap, asset_id: str, asset_path: str, audio_name: str,
+           duration: float | None = None) -> str:
     bs = bars(tm)
     score_bpm = round(tm.bpm)
     pad = -round(bs[0].start * FRAME_RATE)
 
+    synced = list(enumerate(bs if tm.mode == "multi" else bs[:1]))
+    if duration is not None and duration > bs[-1].end:
+        # stretch the last bar (often a held final chord) so playback runs to the end of the audio
+        bs[-1] = replace(bs[-1], end=duration)
+        if synced[-1][0] != len(bs) - 1:
+            synced.append((len(bs) - 1, bs[-1]))
+        else:
+            synced[-1] = (len(bs) - 1, bs[-1])
+
     autos = [_automation("Tempo", 0, f"{score_bpm} 2")]
-    for i, b in enumerate(bs if tm.mode == "multi" else bs[:1]):
+    for i, b in synced:
         bpm = 60 * b.beats / (b.end - b.start)
         frame = round(b.start * FRAME_RATE) + pad
         autos.append(_automation("SyncPoint", i, (
@@ -73,7 +84,8 @@ def _score(gpif: str, tm: TempoMap, asset_id: str, asset_path: str, audio_name: 
     return gpif.replace("</GPIF>", assets + "</GPIF>")
 
 
-def to_gp(tm: TempoMap, audio: str | Path, path: str | Path) -> Path:
+def to_gp(tm: TempoMap, audio: str | Path, path: str | Path, duration: float | None = None) -> Path:
+    """`duration` (seconds of audio) lets the last bar run on to the end of the song."""
     audio = Path(audio)
     data = audio.read_bytes()
     asset_id = str(uuid.UUID(hashlib.sha1(data).hexdigest()[:32]))
@@ -84,7 +96,8 @@ def to_gp(tm: TempoMap, audio: str | Path, path: str | Path) -> Path:
         for item in src.infolist():
             content = src.read(item.filename)
             if item.filename == "Content/score.gpif":
-                content = _score(content.decode("utf-8"), tm, asset_id, asset_path, audio.name).encode("utf-8")
+                content = _score(content.decode("utf-8"), tm, asset_id, asset_path, audio.name,
+                                 duration).encode("utf-8")
             elif item.filename == "meta.json":
                 content = json.dumps({"hasAudio": True, "version": "1.0.0"}, indent=4).encode()
             elif item.filename == "Content/Preferences.json":
