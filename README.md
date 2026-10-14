@@ -1,6 +1,10 @@
 # BeatCop
 
-Beat, downbeat and tempo-map detection from audio. Runs the [Beat This!](https://github.com/CPJKU/beat_this) model (CPJKU, MIT) on ONNX Runtime with a NumPy front end, so there's no PyTorch at runtime. BeatCop will export files compatible with Guitar Pro 8 and Transcribe!.
+BeatCop turns an audio recording into a synchronized musical timeline.
+
+Give it a song, and it detects beats, downbeats, tempo changes, and measure boundaries. It then creates a Guitar Pro 8 score with the original audio synchronized to the measures, a MIDI tempo map for your DAW, and markers for Transcribe!.
+
+Instead of manually figuring out where every measure starts, you can jump straight into transcription.
 
 ## Setup
 
