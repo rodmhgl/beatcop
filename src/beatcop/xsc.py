@@ -3,8 +3,9 @@ beat marker on every other beat.
 
 Open the .xsc in Transcribe! with the audio beside it. Marker lines are
 `type,position,auto-named,label,beats-to-next,h:mm:ss.ffffff,`: type S(ection)/M(easure)/B(eat),
-position -1 (use the time), labels auto-named like Transcribe!'s own (A1, A2, ...), and the beat
-count on each bar so Transcribe! knows the metre.
+position -1 (use the time), labels auto-named like Transcribe!'s own (A1, A2, ...), and
+beats-to-next 1 on every marker since each marker is one beat from the next (a bar's beat count
+there would make Transcribe! subdivide each beat again); the metre follows from the beat markers.
 """
 
 import re
@@ -36,15 +37,15 @@ def sound_file_line(audio: str | Path) -> str:
 
 def to_xsc(tm: TempoMap, audio: str | Path, path: str | Path) -> Path:
     markers = []
-    bar_starts = {b.first_beat: b.beats for b in bars(tm)}
+    bar_starts = {b.first_beat for b in bars(tm)}
     bar_no = 0
     for i, t in enumerate(tm.beats):
         if i in bar_starts:
             bar_no += 1
             kind = "S" if bar_no == 1 else "M"
-            markers.append(f"{kind},-1,1,A{bar_no},{bar_starts[i]},{_stamp(t)},")
+            markers.append(f"{kind},-1,1,A{bar_no},1,{_stamp(t)},")
         else:
-            markers.append(f"B,-1,1,,0,{_stamp(t)},")
+            markers.append(f"B,-1,1,,1,{_stamp(t)},")
 
     lines = [
         *VERSION_LINES,

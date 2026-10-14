@@ -50,7 +50,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--model", type=Path, help="ONNX model (default: models/ or $BEATCOP_MODEL)")
     args = p.parse_args(argv)
 
-    beat_logits, downbeat_logits = detect_frames(*audio.load(args.audio), BeatModel(args.model))
+    signal, sr = audio.load(args.audio)
+    beat_logits, downbeat_logits = detect_frames(signal, sr, BeatModel(args.model))
     beats, downbeats = postprocess.frames_to_beats(beat_logits, downbeat_logits)
     if len(beats) < 2:
         print("no beats detected", file=sys.stderr)
@@ -64,7 +65,8 @@ def main(argv: list[str] | None = None) -> int:
     beats_path = outdir / f"{stem}.beats"
     _write_beats_tsv(tm, beats_path)
     midi_path = None if args.no_midi else midi.to_midi(tm, outdir / f"{stem}_tempo.mid")
-    gp_path = None if args.no_gp else gp.to_gp(tm, args.audio, outdir / f"{stem}_tempo.gp")
+    gp_path = None if args.no_gp else gp.to_gp(tm, args.audio, outdir / f"{stem}_tempo.gp",
+                                                  duration=len(signal) / sr)
     xsc_path = None if args.no_xsc else xsc.to_xsc(tm, args.audio, outdir / f"{stem}.xsc")
     written = [p for p in (beats_path, midi_path, gp_path, xsc_path) if p]
 

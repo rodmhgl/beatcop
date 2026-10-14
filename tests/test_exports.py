@@ -59,7 +59,10 @@ def test_xsc_marks_every_bar_and_beat(tmp_path):
     np.testing.assert_allclose([_secs(r[5]) for r in rows], tm.beats, atol=1e-6)
     bars = [r for r in rows if r[0] in "SM"]
     assert [r[3] for r in bars[:3]] == ["A1", "A2", "A3"]
-    assert [int(r[4]) for r in bars[:3]] == [2, 4, 4]
+    # one beat between consecutive markers, else Transcribe! subdivides each beat
+    assert {int(r[4]) for r in rows} == {1}
+    first_bars = [i for i, r in enumerate(rows) if r[0] in "SM"][:3]
+    assert np.diff(first_bars).tolist() == [2, 4]
 
 
 def test_xsc_points_at_a_windows_path_under_wsl(tmp_path):
@@ -100,6 +103,27 @@ def test_gp_has_a_bar_per_bar_synced_to_the_audio(tmp_path):
     np.testing.assert_allclose((frames - pad) / gp.FRAME_RATE, [b.start for b in bars], atol=1e-4)
     tempos = np.array([float(s.findtext("ModifiedTempo")) for s in syncs])
     np.testing.assert_allclose(tempos, [60 * b.beats / (b.end - b.start) for b in bars], rtol=1e-4)
+
+
+@pytest.mark.parametrize("mode", ["single", "multi"])
+def test_gp_last_bar_runs_to_the_end_of_the_audio(tmp_path, mode):
+    beats = 1.0 + np.arange(40) * 0.5
+    tm = tempo.build(beats, beats[::4], mode=mode)
+    audio = tmp_path / "song.wav"
+    audio.write_bytes(b"RIFF")
+    last = tempo.bars(tm)[-1]
+    duration = last.end + 6.0
+    with zipfile.ZipFile(gp.to_gp(tm, audio, tmp_path / "t.gp", duration=duration)) as z:
+        root = ET.fromstring(z.read("Content/score.gpif"))
+    syncs = [a.find("Value") for a in root.findall("MasterTrack/Automations/Automation")
+             if a.findtext("Type") == "SyncPoint"]
+    final = syncs[-1]
+    assert int(final.findtext("BarIndex")) == len(tempo.bars(tm)) - 1
+    pad = int(root.findtext("BackingTrack/FramePadding"))
+    start = (int(final.findtext("FrameOffset")) - pad) / gp.FRAME_RATE
+    expected = 60 * last.beats / (duration - last.start)
+    assert float(final.findtext("ModifiedTempo")) == pytest.approx(expected, rel=1e-4)
+    assert start == pytest.approx(last.start, abs=1e-4)
 
 
 def test_gp_single_tempo_needs_one_sync_point(tmp_path):
